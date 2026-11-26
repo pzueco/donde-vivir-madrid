@@ -1,0 +1,79 @@
+# Puntos de interés de OpenStreetMap
+# tags: etiquetas OSM a descargar
+# filtro (opcional): se aplica después de descargar
+
+# ---------- Día a día ----------
+supermercados:
+  tags: {shop: supermarket}
+mercados:
+  tags: {amenity: marketplace}
+farmacias:
+  tags: {amenity: pharmacy}
+veterinarios:
+  tags: {amenity: veterinary}
+coworkings:
+  tags: {amenity: coworking_space}
+
+# ---------- Ocio ----------
+restaurantes:
+  tags: {amenity: [restaurant, fast_food]}
+bares_cafeterias:
+  tags: {amenity: [bar, pub, cafe]}
+discotecas:
+  tags: {amenity: nightclub}
+centros_comerciales:
+  tags: {shop: mall}
+
+# ---------- Cultura ----------
+museos:
+  tags: {tourism: museum}
+monumentos:
+  tags: {historic: [monument, castle, palace, archaeological_site]}
+bibliotecas:
+  tags: {amenity: library}
+cines_teatros:
+  tags: {amenity: [cinema, theatre, arts_centre]}
+
+# ---------- Salud ----------
+centros_salud:
+  tags: {amenity: [clinic, doctors]}
+hospitales:
+  tags: {amenity: hospital}
+
+# ---------- Familia ----------
+colegios:
+  tags: {amenity: school}
+guarderias:
+  tags: {amenity: kindergarten}
+parques_infantiles:
+  tags: {leisure: playground}
+parques_perros:
+  tags: {leisure: dog_park}
+
+# ---------- Deporte ----------
+gimnasios:
+  tags: {leisure: fitness_centre}
+campos_futbol:
+  tags: {leisure: pitch}
+  filtro: {sport: [soccer]}
+pistas_tenis_padel:
+  tags: {leisure: pitch}
+  filtro: {sport: [tennis, padel]}
+piscinas:
+  tags: {leisure: [swimming_pool, sports_centre]}
+  filtro: {sport: [swimming]}
+
+# ---------- Transporte ----------
+estaciones_metro:
+  tags: {railway: station}
+  filtro: {station: [subway]}
+estaciones_cercanias:
+  tags: {railway: [station, halt]}
+  filtro: {train: ["yes"]}
+paradas_bus:
+  tags: {highway: bus_stop}
+estaciones_bicimad:
+  tags: {amenity: bicycle_rental}
+estaciones_metro_ligero:
+  tags: {railway: [station, halt, tram_stop]}
+  filtro: {station: [light_rail]}
