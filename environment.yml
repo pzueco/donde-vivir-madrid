@@ -1,0 +1,24 @@
+name: madrid
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - openjdk=21
+  - pandas
+  - numpy
+  - pyarrow
+  - python-duckdb
+  - geopandas
+  - shapely
+  - pyproj
+  - r5py
+  - scikit-learn
+  - lightgbm
+  - shap
+  - matplotlib
+  - plotly
+  - folium
+  - requests
+  - pyyaml
+  - jupyterlab
+  - ipykernel
