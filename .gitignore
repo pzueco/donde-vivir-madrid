@@ -4,3 +4,4 @@ __pycache__/
 *.pbf
 *.duckdb
 .env
+!app/data/
