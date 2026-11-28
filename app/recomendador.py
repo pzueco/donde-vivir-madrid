@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -7,16 +8,32 @@ from geopy.geocoders import Nominatim
 from shapely.geometry import Point
 
 CARPETA = Path(__file__).parent / "data"
+MIN_VIVIENDAS = 300  # menos viviendas alquiladas = dato de precio poco fiable
 
+# ---------------------------------------------------------------- barrios
 B = gpd.read_parquet(CARPETA / "barrios_indices.parquet")
 # Simplificar las formas (tolerancia de 15 m): el mapa pesa mucho menos y no se nota
 B["geometry"] = B.simplify(15, preserve_topology=True)
+
+# Economía: rango de precios (p25-p75), tendencia y estimación 2026
+B = B.merge(pd.read_parquet(CARPETA / "barrios_economia.parquet"), on="cod_barrio", how="left")
+B["eur_m2_2026"] = B["eur_m2_estimado_2026"].fillna(B["eur_m2"])
+COL_SUBIDA = next(c for c in B.columns if re.fullmatch(r"subida_\d{4}_\d{4}", c))
+ANO_BASE, ANO_ULTIMO = map(int, COL_SUBIDA.split("_")[1:])
+
+# Evolución del alquiler por barrio y media de Madrid (ponderada por viviendas)
+EVOLUCION = pd.read_parquet(CARPETA / "evolucion_alquiler.parquet")
+_tot = (
+    EVOLUCION.assign(ponderado=EVOLUCION["eur_m2"] * EVOLUCION["n_viviendas"])
+    .groupby("ano")[["ponderado", "n_viviendas"]].sum()
+)
+SERIE_MADRID = (_tot["ponderado"] / _tot["n_viviendas"]).round(2)
 
 # Un punto dentro de cada barrio (origen de las rutas)
 _PUNTOS = B.representative_point().to_crs(4326)
 PUNTO_BARRIO = {c: (p.y, p.x) for c, p in zip(B["cod_barrio"], _PUNTOS)}
 
-# Tiempos desde cada barrio a una rejilla de puntos (r5py, martes 8:30)
+# ---------------------------------------------------------------- tiempos
 TIEMPOS = pd.read_parquet(CARPETA / "tiempos_barrio.parquet")            # transporte público
 OTROS_MODOS = pd.read_parquet(CARPETA / "tiempos_otros_modos.parquet")   # bici, coche, andando
 REJILLA = gpd.read_parquet(CARPETA / "rejilla_destinos.parquet").to_crs(25830)
@@ -42,6 +59,7 @@ INDICES = ["precio", "transporte", "ocio", "tranquilidad", "cultura",
 PERFILES = {
     "joven":       {"precio": 2, "transporte": 3, "ocio": 3, "deporte": 1, "dia_a_dia": 1},
     "familia":     {"precio": 1, "transporte": 2, "familia": 3, "salud": 2, "tranquilidad": 2, "dia_a_dia": 1},
+    "estudiante":  {"precio": 3, "transporte": 3, "ocio": 2, "cultura": 1, "dia_a_dia": 1},
     "teletrabajo": {"precio": 2, "tranquilidad": 2, "dia_a_dia": 2, "ocio": 1, "deporte": 1},
     "deportista":  {"precio": 1, "transporte": 2, "deporte": 3, "tranquilidad": 1},
     "cultura":     {"precio": 1, "transporte": 2, "cultura": 3, "ocio": 1},
@@ -66,6 +84,11 @@ def nombre_visible(barrio):
     return f"{barrio} ({NOMBRES_POPULARES[barrio]})" if barrio in NOMBRES_POPULARES else barrio
 
 
+def columna_precio(usar_2026):
+    return "eur_m2_2026" if usar_2026 else "eur_m2"
+
+
+# ---------------------------------------------------------------- direcciones
 @lru_cache(maxsize=500)
 def geocodificar(texto):
     """Convierte una dirección en (lat, lon, dirección encontrada). None si no la encuentra."""
@@ -89,6 +112,7 @@ def dentro_de_madrid(lat, lon):
     return MADRID_4326.contains(Point(lon, lat))
 
 
+# ---------------------------------------------------------------- tiempos
 def _destino_cercano(lat, lon):
     """Punto de la rejilla más cercano y minutos a pie desde él hasta (lat, lon)."""
     punto = gpd.GeoSeries([Point(lon, lat)], crs=4326).to_crs(25830).iloc[0]
@@ -129,13 +153,15 @@ def coste_tiempo(minutos, valor_hora):
     return horas_ano.round(0), (horas_ano * valor_hora / 12).round(0)
 
 
+# ---------------------------------------------------------------- recomendador
 def recomendar(presupuesto, m2, pesos, minutos=None, max_minutos=None, valor_hora=10,
-               n=10, min_viviendas=300, factor_precio=1.0, holgura_max=0.30):
+               usar_2026=False, dividir_entre=1, n=10, min_viviendas=MIN_VIVIENDAS, holgura_max=0.30):
     pesos = {k: w for k, w in pesos.items() if w > 0}
     etiquetas = dict(ETIQUETAS)
 
     d = B.copy()
-    d["alquiler_estimado"] = (d["eur_m2"] * m2 * factor_precio).round(0)
+    # Alquiler del piso entero o, si se comparte, por habitación
+    d["alquiler_estimado"] = (d[columna_precio(usar_2026)] * m2 / dividir_entre).round(0)
     d = d[(d["alquiler_estimado"] <= presupuesto) & (d["n_viviendas"] >= min_viviendas)].copy()
 
     # Tiempo hasta el trabajo: filtra, sustituye al índice de transporte y da el coste real
@@ -169,3 +195,25 @@ def recomendar(presupuesto, m2, pesos, minutos=None, max_minutos=None, valor_hor
         cols += ["minutos_trabajo", "horas_ano", "coste_real"]
     cols += ["por_que", "dist_tren_m", "geometry"]
     return d.sort_values("puntuacion", ascending=False)[cols].head(n)
+
+
+# ---------------------------------------------------------------- economía
+def asequibilidad(sueldo, m2, usar_2026):
+    """Alquiler estimado y % del sueldo que supondría en cada barrio con datos fiables."""
+    d = B[B["n_viviendas"] >= MIN_VIVIENDAS].copy()
+    d["alquiler"] = (d[columna_precio(usar_2026)] * m2).round(0)
+    d["esfuerzo"] = (d["alquiler"] / sueldo * 100).round(0)
+    d["nombre"] = d["barrio"].map(nombre_visible)
+    return d.sort_values("esfuerzo")
+
+
+def rango_precio(cod_barrio, m2, usar_2026):
+    """Percentil 25, mediana y percentil 75 del alquiler del barrio para esos metros."""
+    f = B[B["cod_barrio"] == cod_barrio].iloc[0]
+    factor = f["eur_m2_2026"] / f["eur_m2"] if usar_2026 else 1.0
+    return {
+        "p25": f["eur_m2_p25"] * factor * m2,
+        "mediana": f["eur_m2"] * factor * m2,
+        "p75": f["eur_m2_p75"] * factor * m2,
+        "fiable": f["n_viviendas"] >= MIN_VIVIENDAS,
+    }
