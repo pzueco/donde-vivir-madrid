@@ -71,7 +71,24 @@ def marcar_trabajo(m, coords):
 
 def a_iframe(m):
     xmin, ymin, xmax, ymax = B_WGS84.total_bounds
-    m.fit_bounds([[ymin, xmin], [ymax, xmax]])
+    limites = [[ymin, xmin], [ymax, xmax]]
+    m.fit_bounds(limites)
+
+    # Recalcular tamaño y encuadre cuando el mapa se hace visible o cambia de tamaño
+    # (si se dibuja en una pestaña oculta, al principio no tiene tamaño y el zoom sale mal)
+    nombre = m.get_name()
+    script = f"""
+    <script>
+    function reencuadrar() {{
+        {nombre}.invalidateSize();
+        {nombre}.fitBounds({limites});
+    }}
+    window.addEventListener('load', function() {{ setTimeout(reencuadrar, 300); }});
+    window.addEventListener('resize', reencuadrar);
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(script))
+
     pagina = m.get_root().render()
     return (
         f'<iframe srcdoc="{html.escape(pagina)}" '
