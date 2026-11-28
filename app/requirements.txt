@@ -1,0 +1,7 @@
+gradio
+geopandas
+pandas
+pyarrow
+folium
+matplotlib
+mapclassify

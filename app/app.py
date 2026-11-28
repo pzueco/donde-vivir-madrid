@@ -6,6 +6,17 @@ import pandas as pd
 
 from recomendador import B, ETIQUETAS, INDICES, PERFILES, recomendar
 
+# En Hugging Face (ZeroGPU) hace falta al menos una función marcada con @spaces.GPU.
+# No usa la GPU para nada; en local, sin la librería "spaces", se ignora.
+try:
+    import spaces
+
+    @spaces.GPU(duration=1)
+    def _activar_zerogpu():
+        return None
+except ImportError:
+    pass
+
 B_WGS84 = B.to_crs(4326)
 
 M2_POR_HABITACIONES = {"Estudio": 35, "1": 50, "2": 70, "3": 90, "4 o más": 115}
