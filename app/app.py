@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 
 from recomendador import (
     B, DIAS_LABORABLES, ETIQUETAS, INDICES, PERFILES,
-    dentro_de_madrid, geocodificar, idx_transporte_trabajo,
+    dentro_de_madrid, enlace_google_maps, geocodificar, idx_transporte_trabajo,
     minutos_hasta, nombre_visible, recomendar,
 )
 
@@ -44,6 +44,13 @@ ZONAS_TRABAJO = {
     "Hospital 12 de Octubre": (40.3750, -3.6990),
 }
 ZONAS_CON_DIRECCION = [z for z, c in ZONAS_TRABAJO.items() if c]
+
+MODOS = {
+    "🚇 Transporte público": "transporte",
+    "🚲 Bici": "bici",
+    "🚗 Coche (sin tráfico)": "coche",
+    "🚶 Andando": "andando",
+}
 
 NOMBRE_A_BARRIO = {nombre_visible(b): b for b in sorted(B["barrio"])}
 
@@ -133,6 +140,14 @@ def leyenda_isocrona():
     return f'<div style="margin-bottom:8px;">{"".join(partes)}</div>'
 
 
+def texto_minutos(mn):
+    if pd.isna(mn):
+        return "más de 2 h"
+    if mn >= 60:
+        return f"{int(mn // 60)} h {int(mn % 60)} min"
+    return f"{mn:.0f} min"
+
+
 # ---------------------------------------------------------------- pestaña 1: recomendador
 def m2_de_habitaciones(habitaciones):
     return M2_POR_HABITACIONES[habitaciones]
@@ -206,8 +221,13 @@ def buscar(presupuesto, m2, zona, direccion, max_minutos, valor_hora, *valores):
             pd.DataFrame(), aviso,
         )
 
+    tabla = res.drop(columns="geometry").copy()
+    if coords:
+        tabla["como_llegar"] = tabla["cod_barrio"].map(
+            lambda c: f"[Ver ruta]({enlace_google_maps(c, coords)})"
+        )
     tabla = (
-        res.drop(columns="geometry")
+        tabla.drop(columns="cod_barrio")
         .rename(columns={
             "nombre": "Barrio",
             "distrito": "Distrito",
@@ -218,19 +238,22 @@ def buscar(presupuesto, m2, zona, direccion, max_minutos, valor_hora, *valores):
             "coste_real": "Coste real (€/mes)",
             "por_que": "Por qué",
             "dist_tren_m": "Tren más cercano (m)",
+            "como_llegar": "Cómo llegar",
         })
+        .astype(str)
     )
     resumen = "\n\n".join(t for t in [aviso, resumen_coste(res, valor_hora)] if t)
     return mapa_recomendacion(res, coords), tabla, resumen
 
 
 # ---------------------------------------------------------------- pestaña 2: isócronas
-def isocrona(zona, direccion):
+def isocrona(zona, direccion, modo_texto):
     coords, nombre_trabajo, aviso, ok = resolver_trabajo(zona, direccion)
     if not ok:
         return "", aviso
 
-    minutos = minutos_hasta(*coords)
+    modo = MODOS[modo_texto]
+    minutos = minutos_hasta(*coords, modo=modo)
 
     d = B_WGS84.copy()
     d["minutos"] = d["cod_barrio"].map(minutos)
@@ -243,7 +266,7 @@ def isocrona(zona, direccion):
                 return color
 
     d["color"] = d["minutos"].apply(franja)
-    d["minutos_txt"] = d["minutos"].apply(lambda x: "más de 90 min" if pd.isna(x) else f"{x:.0f} min")
+    d["minutos_txt"] = d["minutos"].apply(texto_minutos)
 
     m = mapa_base()
     folium.GeoJson(
@@ -254,13 +277,13 @@ def isocrona(zona, direccion):
         },
         tooltip=folium.GeoJsonTooltip(
             fields=["barrio", "distrito", "minutos_txt"],
-            aliases=["Barrio", "Distrito", "En transporte público"],
+            aliases=["Barrio", "Distrito", modo_texto],
         ),
     ).add_to(m)
     marcar_trabajo(m, coords)
 
     resumen = (
-        f"Desde **{nombre_trabajo}**, en transporte público: "
+        f"Desde **{nombre_trabajo}**, {modo_texto.lower()}: "
         f"**{(d['minutos'] <= 15).sum()}** barrios a menos de 15 min, "
         f"**{(d['minutos'] <= 30).sum()}** a menos de 30 y "
         f"**{(d['minutos'] <= 45).sum()}** a menos de 45 (de 131)."
@@ -273,6 +296,8 @@ def isocrona(zona, direccion):
             f"**{nombre_visible(barato['barrio'])}**: {barato['eur_m2']:.1f} €/m² "
             f"y {barato['minutos']:.0f} min."
         )
+    if modo == "coche":
+        resumen += "\n\n*En coche, sin tráfico: en hora punta los tiempos reales pueden ser bastante mayores.*"
     if aviso:
         resumen = f"{aviso}\n\n{resumen}"
     return leyenda_isocrona() + a_iframe(m), resumen
@@ -284,10 +309,12 @@ def comparar(nombre_a, nombre_b, zona, direccion, m2):
     if not ok:
         return None, pd.DataFrame(), aviso
 
-    minutos = minutos_hasta(*coords) if coords else None
+    tiempos = {}
+    if coords:
+        tiempos = {m: minutos_hasta(*coords, modo=m) for m in ["transporte", "bici", "coche", "andando"]}
 
     etiquetas = {k: ETIQUETAS[k].capitalize() for k in INDICES}
-    if minutos is not None:
+    if coords:
         etiquetas["transporte"] = "Cerca de tu trabajo"
     ejes = [etiquetas[k] for k in INDICES]
 
@@ -295,22 +322,27 @@ def comparar(nombre_a, nombre_b, zona, direccion, m2):
     tabla = {}
     for nombre in [nombre_a, nombre_b]:
         fila = B[B["barrio"] == NOMBRE_A_BARRIO[nombre]].iloc[0]
+        cod = fila["cod_barrio"]
         valores = {k: fila[f"idx_{k}"] for k in INDICES}
         datos = {
             "€/m² al mes": f"{fila['eur_m2']:.1f}",
             f"Alquiler estimado ({m2} m²)": f"{fila['eur_m2'] * m2:.0f} €",
             "Tren más cercano": f"{fila['dist_tren_m']:.0f} m",
         }
-        if minutos is not None:
-            mn = minutos.get(fila["cod_barrio"])
+        if coords:
+            mn = tiempos["transporte"].get(cod)
             if pd.isna(mn):
                 valores["transporte"] = 0
-                datos["Minutos al trabajo"] = "más de 90"
+                datos["🚇 Transporte público"] = "más de 90 min"
                 datos["Horas al año en transporte"] = "—"
             else:
                 valores["transporte"] = float(idx_transporte_trabajo(pd.Series([mn])).iloc[0])
-                datos["Minutos al trabajo"] = f"{mn:.0f}"
+                datos["🚇 Transporte público"] = texto_minutos(mn)
                 datos["Horas al año en transporte"] = f"{mn * 2 * DIAS_LABORABLES / 60:.0f}"
+            datos["🚲 Bici"] = texto_minutos(tiempos["bici"].get(cod))
+            datos["🚗 Coche (sin tráfico)"] = texto_minutos(tiempos["coche"].get(cod))
+            datos["🚶 Andando"] = texto_minutos(tiempos["andando"].get(cod))
+            datos["Cómo llegar"] = f"[Ver ruta en Google Maps]({enlace_google_maps(cod, coords)})"
 
         r = [valores[k] * 100 for k in INDICES]
         fig.add_trace(go.Scatterpolar(
@@ -360,14 +392,15 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?") as demo:
                 with gr.Column(scale=2):
                     mapa = gr.HTML()
             resumen = gr.Markdown()
-            tabla = gr.Dataframe(interactive=False)
+            tabla = gr.Dataframe(interactive=False, datatype="markdown")
 
         # ------------------------------------------------ Isócronas
         with gr.Tab("⏱️ ¿Qué tengo cerca?"):
-            gr.Markdown("Elige dónde trabajas y mira cuánto tardas desde cada barrio de Madrid en transporte público.")
+            gr.Markdown("Elige dónde trabajas y cómo te mueves, y mira cuánto tardas desde cada barrio de Madrid.")
             with gr.Row():
                 trabajo_iso = gr.Dropdown(ZONAS_CON_DIRECCION, value="Nuevos Ministerios / AZCA", label="¿Dónde trabajas?")
                 direccion_iso = gr.Textbox(label=TEXTO_DIRECCION, placeholder=EJEMPLO_DIRECCION)
+            modo_iso = gr.Radio(list(MODOS), value="🚇 Transporte público", label="¿Cómo te mueves?")
             boton_iso = gr.Button("Ver mapa", variant="primary")
             resumen_iso = gr.Markdown()
             mapa_iso = gr.HTML()
@@ -385,15 +418,16 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?") as demo:
             aviso_cmp = gr.Markdown()
             with gr.Row():
                 radar = gr.Plot()
-                tabla_cmp = gr.Dataframe(interactive=False)
+                tabla_cmp = gr.Dataframe(interactive=False, datatype="markdown")
 
     gr.Markdown(
         "*Alquiler estimado = mediana de €/m² de contratos de pisos declarados en 2024 × metros: "
         "precio de referencia, normalmente por debajo de los anuncios actuales; pisos completos, "
-        "no habitaciones. Tiempos en transporte público calculados con r5py y los horarios GTFS "
-        "del CRTM y la EMT (martes, salida entre 8:30 y 8:35), solo con destinos dentro del "
-        "municipio; para una dirección escrita se suma el tramo a pie desde el punto calculado "
-        "más cercano. Direcciones localizadas con Nominatim (© OpenStreetMap). "
+        "no habitaciones. Tiempos calculados con r5py: transporte público con los horarios GTFS "
+        "del CRTM y la EMT (martes, salida entre 8:30 y 8:35); bici a velocidad tranquila y por "
+        "calles poco transitadas; coche sin tráfico. Solo hay destinos dentro del municipio; para "
+        "una dirección escrita se suma el tramo a pie desde el punto calculado más cercano. "
+        "Direcciones localizadas con Nominatim (© OpenStreetMap); rutas detalladas en Google Maps. "
         "Coste real = alquiler + horas de transporte al año (ida y vuelta, "
         f"{DIAS_LABORABLES} días laborables) valoradas al precio que elijas; el abono no se "
         "incluye porque todo el municipio está en la misma zona tarifaria. Solo se recomiendan "
@@ -402,16 +436,17 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?") as demo:
 
     # Eventos
     entradas = [presupuesto, m2, trabajo, direccion, max_minutos, valor_hora] + sliders
-    entradas_iso = [trabajo_iso, direccion_iso]
+    entradas_iso = [trabajo_iso, direccion_iso, modo_iso]
     entradas_cmp = [barrio_a, barrio_b, trabajo_cmp, direccion_cmp, m2_cmp]
 
     habitaciones.change(m2_de_habitaciones, habitaciones, m2)
     perfil.change(pesos_de_perfil, perfil, sliders)
 
     boton.click(buscar, entradas, [mapa, tabla, resumen])
-    direccion.submit(buscar, entradas, [mapa, tabla, resumen])          # Enter en el cuadro
+    direccion.submit(buscar, entradas, [mapa, tabla, resumen])
     boton_iso.click(isocrona, entradas_iso, [mapa_iso, resumen_iso])
     direccion_iso.submit(isocrona, entradas_iso, [mapa_iso, resumen_iso])
+    modo_iso.change(isocrona, entradas_iso, [mapa_iso, resumen_iso])
     boton_cmp.click(comparar, entradas_cmp, [radar, tabla_cmp, aviso_cmp])
     direccion_cmp.submit(comparar, entradas_cmp, [radar, tabla_cmp, aviso_cmp])
 

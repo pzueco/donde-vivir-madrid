@@ -12,8 +12,13 @@ B = gpd.read_parquet(CARPETA / "barrios_indices.parquet")
 # Simplificar las formas (tolerancia de 15 m): el mapa pesa mucho menos y no se nota
 B["geometry"] = B.simplify(15, preserve_topology=True)
 
-# Tiempos en transporte público (r5py, martes 8:30) desde cada barrio a una rejilla de puntos
-TIEMPOS = pd.read_parquet(CARPETA / "tiempos_barrio.parquet")
+# Un punto dentro de cada barrio (origen de las rutas)
+_PUNTOS = B.representative_point().to_crs(4326)
+PUNTO_BARRIO = {c: (p.y, p.x) for c, p in zip(B["cod_barrio"], _PUNTOS)}
+
+# Tiempos desde cada barrio a una rejilla de puntos (r5py, martes 8:30)
+TIEMPOS = pd.read_parquet(CARPETA / "tiempos_barrio.parquet")            # transporte público
+OTROS_MODOS = pd.read_parquet(CARPETA / "tiempos_otros_modos.parquet")   # bici, coche, andando
 REJILLA = gpd.read_parquet(CARPETA / "rejilla_destinos.parquet").to_crs(25830)
 
 # Contorno del municipio, para comprobar si una dirección está dentro
@@ -27,6 +32,9 @@ _GEOLOCALIZADOR = Nominatim(
 
 DIAS_LABORABLES = 220
 VELOCIDAD_A_PIE = 80  # metros por minuto
+
+COLUMNA_MODO = {"bici": "min_bici", "coche": "min_coche", "andando": "min_andando"}
+MODO_GOOGLE = {"transporte": "transit", "bici": "bicycling", "coche": "driving", "andando": "walking"}
 
 INDICES = ["precio", "transporte", "ocio", "tranquilidad", "cultura",
            "salud", "familia", "deporte", "dia_a_dia"]
@@ -81,16 +89,33 @@ def dentro_de_madrid(lat, lon):
     return MADRID_4326.contains(Point(lon, lat))
 
 
-def minutos_hasta(lat, lon):
-    """Minutos en transporte público desde cada barrio hasta el punto (lat, lon)."""
+def _destino_cercano(lat, lon):
+    """Punto de la rejilla más cercano y minutos a pie desde él hasta (lat, lon)."""
     punto = gpd.GeoSeries([Point(lon, lat)], crs=4326).to_crs(25830).iloc[0]
     distancias = REJILLA.distance(punto)
     i = distancias.idxmin()
-    destino = REJILLA.loc[i, "id"]
-    # Minutos andando desde el punto de la rejilla hasta la dirección exacta
-    extra = round(distancias.loc[i] / VELOCIDAD_A_PIE)
-    t = TIEMPOS[TIEMPOS["id_destino"] == destino]
-    return t.set_index("cod_barrio")["minutos"] + extra
+    return REJILLA.loc[i, "id"], round(distancias.loc[i] / VELOCIDAD_A_PIE)
+
+
+def minutos_hasta(lat, lon, modo="transporte"):
+    """Minutos desde cada barrio hasta (lat, lon): transporte, bici, coche o andando."""
+    destino, extra = _destino_cercano(lat, lon)
+    if modo == "transporte":
+        t = TIEMPOS[TIEMPOS["id_destino"] == destino].set_index("cod_barrio")["minutos"]
+    else:
+        t = OTROS_MODOS[OTROS_MODOS["id_destino"] == destino].set_index("cod_barrio")[COLUMNA_MODO[modo]]
+    return t + extra
+
+
+def enlace_google_maps(cod_barrio, destino, modo="transporte"):
+    """Enlace a la ruta en Google Maps desde el barrio hasta el destino (lat, lon)."""
+    lat_o, lon_o = PUNTO_BARRIO[cod_barrio]
+    lat_d, lon_d = destino
+    return (
+        "https://www.google.com/maps/dir/?api=1"
+        f"&origin={lat_o:.5f},{lon_o:.5f}&destination={lat_d:.5f},{lon_d:.5f}"
+        f"&travelmode={MODO_GOOGLE[modo]}"
+    )
 
 
 def idx_transporte_trabajo(minutos):
@@ -139,7 +164,7 @@ def recomendar(presupuesto, m2, pesos, minutos=None, max_minutos=None, valor_hor
     d["por_que"] = d.apply(motivos, axis=1)
     d["nombre"] = d["barrio"].map(nombre_visible)
 
-    cols = ["nombre", "distrito", "puntuacion", "alquiler_estimado"]
+    cols = ["cod_barrio", "nombre", "distrito", "puntuacion", "alquiler_estimado"]
     if minutos is not None:
         cols += ["minutos_trabajo", "horas_ano", "coste_real"]
     cols += ["por_que", "dist_tren_m", "geometry"]
