@@ -1,4 +1,5 @@
 import html
+import math
 
 import folium
 import gradio as gr
@@ -6,10 +7,11 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from recomendador import (
-    ANO_BASE, ANO_ULTIMO, B, COL_SUBIDA, DIAS_LABORABLES, ETIQUETAS, EVOLUCION, INDICES,
-    MIN_VIVIENDAS, PERFILES, SERIE_MADRID,
-    asequibilidad, dentro_de_madrid, enlace_google_maps, geocodificar,
-    idx_transporte_trabajo, minutos_hasta, nombre_visible, rango_precio, recomendar,
+    ANO_BASE, ANO_ULTIMO, B, COL_SUBIDA, DIAS_LABORABLES, ETIQUETAS, EVOLUCION, FACTOR_RODEO,
+    INDICES, LUGARES, MIN_VIVIENDAS, PERFILES, SERIE_MADRID, TIPOS_LUGAR, VELOCIDAD_A_PIE,
+    asequibilidad, barrio_de, dentro_de_madrid, enlace_google_maps, enlace_ruta, geocodificar,
+    idx_transporte_trabajo, lugares_cerca, minutos_hasta, nombre_visible, rango_precio,
+    recomendar, trayecto,
 )
 
 # En Hugging Face (ZeroGPU) hace falta al menos una función marcada con @spaces.GPU.
@@ -75,6 +77,19 @@ MODOS = {
     "🚗 Coche (sin tráfico)": "coche",
     "🚶 Andando": "andando",
 }
+
+TIPOS_POR_DEFECTO = [
+    "🍺 Bares y cafeterías", "🍽️ Restaurantes", "🌞 Terrazas", "🪩 Discotecas y bares de copas",
+    "🗿 Monumentos y lugares de interés",
+    "🏛️ Museos", "🌳 Parques", "⚽ Campos de fútbol", "💪 Gimnasios",
+    "🛒 Supermercados y mercados", "🚇 Metro, Cercanías y Metro Ligero",
+]
+_PALETA = ["#f97316", "#db2777", "#7c3aed", "#2563eb", "#0891b2", "#16a34a", "#ca8a04", "#dc2626",
+           "#9333ea", "#0d9488", "#ea580c", "#4f46e5", "#65a30d", "#be123c", "#0284c7", "#a16207",
+           "#475569", "#c026d3", "#059669", "#b45309", "#1d4ed8", "#e11d48", "#15803d"]
+COLOR_TIPO = {t: _PALETA[i % len(_PALETA)] for i, t in enumerate(TIPOS_LUGAR)}
+MAX_EN_MAPA = 15     # lugares por tipo que se dibujan en el mapa
+MAX_EN_TABLA = 5     # lugares por tipo que salen en la tabla
 
 NOMBRE_A_BARRIO = {nombre_visible(b): b for b in sorted(B["barrio"])}
 BARRIO_A_COD = dict(zip(B["barrio"], B["cod_barrio"]))
@@ -231,9 +246,11 @@ def marcar_trabajo(m, coords):
         ).add_to(m)
 
 
-def a_iframe(m):
-    xmin, ymin, xmax, ymax = B_WGS84.total_bounds
-    limites = [[ymin, xmin], [ymax, xmax]]
+def a_iframe(m, limites=None):
+    """Mapa → iframe. Por defecto encuadra todo Madrid; si no, los límites [[s, o], [n, e]]."""
+    if limites is None:
+        xmin, ymin, xmax, ymax = B_WGS84.total_bounds
+        limites = [[ymin, xmin], [ymax, xmax]]
     m.fit_bounds(limites)
 
     # Recalcular tamaño y encuadre cuando el mapa se hace visible o cambia de tamaño
@@ -426,7 +443,113 @@ def buscar(para_quien, habitaciones, presupuesto, m2, zona, direccion, max_minut
     return mapa_recomendacion(res, coords), tabla, resumen
 
 
-# ================================================================ pestaña 2: isócronas
+# ================================================================ pestaña 2: tu casa y alrededores
+def mapa_casa(casa, trabajo, radio, d):
+    m = mapa_base()
+    folium.Circle(casa, radius=radio, color="#f97316", weight=2, fill=True, fill_opacity=0.06).add_to(m)
+    for tipo, sub in d.groupby("tipo", sort=False):
+        for _, p in sub.head(MAX_EN_MAPA).iterrows():
+            folium.CircleMarker(
+                [p["lat"], p["lon"]], radius=6, color="white", weight=1,
+                fill=True, fill_color=COLOR_TIPO[tipo], fill_opacity=0.95,
+                tooltip=f"{tipo} · {p['nombre']} · {p['min_andando']} min andando",
+            ).add_to(m)
+    folium.Marker(casa, tooltip="Tu casa", icon=folium.Icon(color="green", icon="home", prefix="fa")).add_to(m)
+    marcar_trabajo(m, trabajo)
+
+    # Encuadre: el círculo alrededor de casa
+    lat, lon = casa
+    dlat = radio / 111_000 * 1.15
+    dlon = dlat / max(0.1, math.cos(math.radians(lat)))
+    return a_iframe(m, [[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]])
+
+
+def mi_casa(direccion_casa, zona, direccion_trabajo, radio, tipos):
+    if not direccion_casa or not direccion_casa.strip():
+        return ("", "Escribe la dirección de tu casa (o la del piso que estás mirando).", "", pd.DataFrame())
+    r = geocodificar(direccion_casa)
+    if r is None:
+        return ("", f"⚠️ No hemos encontrado «{direccion_casa}». Prueba con calle, número y barrio.",
+                "", pd.DataFrame())
+    lat, lon, encontrada = r
+    if not dentro_de_madrid(lat, lon):
+        return ("", f"⚠️ «{encontrada}» está fuera del municipio de Madrid. Por ahora solo cubrimos Madrid capital.",
+                "", pd.DataFrame())
+    casa = (lat, lon)
+
+    # ---- Tu casa y el trayecto al trabajo
+    fila = barrio_de(lat, lon)
+    partes = [f"📍 **Tu casa:** *{encontrada}*"]
+    if fila is not None:
+        partes.append(f"🏘️ Barrio de **{nombre_visible(fila['barrio'])}** ({fila['distrito']}) · "
+                      f"{fila['eur_m2']:.1f} €/m² de alquiler")
+
+    coords_trabajo, nombre_trabajo, aviso, ok = resolver_trabajo(zona, direccion_trabajo)
+    if not ok:
+        partes.append(aviso)
+        coords_trabajo = None
+    elif coords_trabajo:
+        if aviso:
+            partes.append(aviso)
+        tiempos, dist = trayecto(casa, coords_trabajo)
+        destino = "al trabajo" if nombre_trabajo == "tu dirección" else f"a {nombre_trabajo}"
+        filas = ["| ¿Cómo? | Tiempo aprox. | Ruta exacta |", "|---|---|---|"]
+        for texto, modo in MODOS.items():
+            mn = tiempos[modo]
+            filas.append(f"| {texto} | **{texto_minutos(mn) if mn is not None else '—'}** | "
+                         f"[Ver en Google Maps]({enlace_ruta(casa, coords_trabajo, modo)}) |")
+        bloque = (f"### 🏠 → 💼 De casa {destino}\n"
+                  f"A **{dist / 1000:.1f} km** en línea recta.\n\n" + "\n".join(filas))
+        mn_tp = tiempos["transporte"]
+        if mn_tp is not None and pd.notna(mn_tp):
+            horas = mn_tp * 2 * DIAS_LABORABLES / 60
+            bloque += (f"\n\n⏳ En transporte público son unas **{horas:.0f} horas al año** "
+                       f"(ida y vuelta, {DIAS_LABORABLES} días laborables).")
+        bloque += ("\n\n*Tiempos calculados desde tu barrio a las 8:30 de un martes; "
+                   "Google Maps te da la ruta exacta puerta a puerta.*")
+        partes.append(bloque)
+    texto_casa = "\n\n".join(partes)
+
+    # ---- Lugares de interés cercanos
+    if LUGARES.empty:
+        return ("", texto_casa, "⚠️ Faltan los datos de lugares: ejecuta `python scripts/preparar_lugares.py`.",
+                pd.DataFrame())
+    tipos = [t for t in TIPOS_LUGAR if t in (tipos or [])]
+    if not tipos:
+        return (mapa_casa(casa, coords_trabajo, radio, lugares_cerca(lat, lon, radio, ["-"])),
+                texto_casa, "Marca al menos un tipo de lugar.", pd.DataFrame())
+    d = lugares_cerca(lat, lon, radio, tipos)
+
+    min_radio = radio * FACTOR_RODEO / VELOCIDAD_A_PIE
+    lineas = [f"### 🧭 Lo que tienes a menos de {radio:,} m (~{min_radio:.0f} min andando)".replace(",", ".")]
+    for tipo in tipos:
+        sub = d[d["tipo"] == tipo]
+        if sub.empty:
+            lineas.append(f"- {tipo}: *ninguno tan cerca*")
+            continue
+        con_nombre = sub[sub["nombre"] != "Sin nombre"]
+        p = (con_nombre if not con_nombre.empty else sub).iloc[0]
+        lineas.append(
+            f"- **{tipo}: {len(sub)}** · el más cercano, *{p['nombre']}*, a {p['min_andando']} min "
+            f"([ruta]({enlace_ruta(casa, (p['lat'], p['lon']))}))"
+        )
+    lineas.append("\n*Distancia andando estimada (línea recta + 30 %). Datos del censo de locales "
+                  "del Ayuntamiento de Madrid y de © OpenStreetMap.*")
+
+    tabla = d.groupby("tipo", sort=False).head(MAX_EN_TABLA).copy()
+    tabla["orden"] = tabla["tipo"].map({t: i for i, t in enumerate(tipos)})
+    tabla = tabla.sort_values(["orden", "dist_m"])
+    tabla = pd.DataFrame({
+        "Tipo": tabla["tipo"],
+        "Nombre": tabla["nombre"],
+        "Distancia": tabla["dist_m"].map(lambda m: f"{m:.0f} m"),
+        "Andando": tabla["min_andando"].map(lambda m: f"{m} min"),
+        "Cómo llegar": [f"[Ver ruta]({enlace_ruta(casa, (a, b))})" for a, b in zip(tabla["lat"], tabla["lon"])],
+    })
+    return mapa_casa(casa, coords_trabajo, radio, d), texto_casa, "\n".join(lineas), tabla
+
+
+# ================================================================ isócronas
 def isocrona(zona, direccion, modo_texto):
     coords, nombre_trabajo, aviso, ok = resolver_trabajo(zona, direccion)
     if not ok:
@@ -694,7 +817,30 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
             tabla = gr.Dataframe(interactive=False, datatype="markdown")
 
         # ------------------------------------------------ Isócronas
-        with gr.Tab("⏱️ ¿Qué tengo cerca?"):
+        with gr.Tab("📍 Tu casa y alrededores"):
+            with gr.Column(elem_classes="tarjeta"):
+                gr.Markdown("### 🏡 Escribe dónde vives (o el piso que estás mirando) y descubre qué tienes cerca")
+                with gr.Row():
+                    direccion_casa = gr.Textbox(label="Dirección de tu casa", value="Calle de Fuencarral 100",
+                                                placeholder="Ej.: Calle de Bravo Murillo 150", scale=2)
+                    radio_casa = gr.Slider(300, 2000, value=1000, step=100, scale=1,
+                                           label="Distancia máxima (metros)")
+                with gr.Row():
+                    trabajo_casa = gr.Dropdown(list(ZONAS_TRABAJO), value="Nuevos Ministerios / AZCA",
+                                               label="Trabajo o centro de estudios")
+                    direccion_trabajo_casa = gr.Textbox(label=TEXTO_DIRECCION, placeholder=EJEMPLO_DIRECCION)
+                tipos_casa = gr.CheckboxGroup(list(TIPOS_LUGAR), value=TIPOS_POR_DEFECTO,
+                                              label="¿Qué te interesa tener cerca?")
+                boton_casa = gr.Button("🔎 Ver qué tengo cerca", variant="primary", elem_classes="boton-principal")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1):
+                    texto_casa = gr.Markdown(elem_classes="resumen")
+                    resumen_casa = gr.Markdown(elem_classes="resumen")
+                with gr.Column(scale=2):
+                    mapa_casa_html = gr.HTML()
+            tabla_casa = gr.Dataframe(interactive=False, datatype="markdown")
+
+            gr.HTML('<div class="titulo-seccion">🗺️ ¿Desde qué barrios llego rápido?</div>')
             with gr.Column(elem_classes="tarjeta"):
                 gr.Markdown("### Elige a dónde vas cada día y cómo te mueves, y mira cuánto tardas desde cada barrio.")
                 with gr.Row():
@@ -777,6 +923,8 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
     entradas = ([para_quien, habitaciones, presupuesto, m2, trabajo, direccion,
                  max_minutos, valor_hora, usar_2026] + sliders)
     entradas_iso = [trabajo_iso, direccion_iso, modo_iso]
+    entradas_casa = [direccion_casa, trabajo_casa, direccion_trabajo_casa, radio_casa, tipos_casa]
+    salidas_casa = [mapa_casa_html, texto_casa, resumen_casa, tabla_casa]
     entradas_cmp = [barrio_a, barrio_b, trabajo_cmp, direccion_cmp, m2_cmp]
     entradas_aseq = [sueldo, porcentaje, m2_eco, usar_2026_eco]
     entradas_chk = [barrio_chk, m2_chk, precio_chk, usar_2026_chk]
@@ -787,6 +935,9 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
 
     boton.click(buscar, entradas, [mapa, tabla, resumen])
     direccion.submit(buscar, entradas, [mapa, tabla, resumen])
+    boton_casa.click(mi_casa, entradas_casa, salidas_casa)
+    direccion_casa.submit(mi_casa, entradas_casa, salidas_casa)
+    direccion_trabajo_casa.submit(mi_casa, entradas_casa, salidas_casa)
     boton_iso.click(isocrona, entradas_iso, [mapa_iso, resumen_iso])
     direccion_iso.submit(isocrona, entradas_iso, [mapa_iso, resumen_iso])
     modo_iso.change(isocrona, entradas_iso, [mapa_iso, resumen_iso])
@@ -797,6 +948,7 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
     boton_evo.click(ver_evolucion, barrios_evo, [grafico_evo, resumen_evo, ranking_evo])
 
     demo.load(buscar, entradas, [mapa, tabla, resumen])
+    demo.load(mi_casa, entradas_casa, salidas_casa)
     demo.load(isocrona, entradas_iso, [mapa_iso, resumen_iso])
     demo.load(comparar, entradas_cmp, [radar, tabla_cmp, aviso_cmp])
     demo.load(calcular_asequibilidad, entradas_aseq, [mapa_aseq, resumen_aseq])
