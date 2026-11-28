@@ -5,3 +5,4 @@ pyarrow
 folium
 matplotlib
 mapclassify
+plotly
