@@ -714,6 +714,76 @@ def comprobar_precio(nombre, m2, precio, usar_2026):
     return texto
 
 
+FRANJAS_MODELO = [   # diferencia entre el precio real y el que "debería" tener (%)
+    (-10, "Más de un 10 % más barato", "#1a9850"),
+    (-3, "Entre un 3 y un 10 % más barato", "#91cf60"),
+    (3, "Lo esperado (±3 %)", "#ffffbf"),
+    (10, "Entre un 3 y un 10 % más caro", "#fc8d59"),
+    (1000, "Más de un 10 % más caro", "#d73027"),
+]
+
+
+def _modelo_fiable(d):
+    return d["diferencia_pct"].notna() & (d["n_viviendas"] >= MIN_VIVIENDAS) & (d["n_secciones"] >= 3)
+
+
+def precio_justo(nombre):
+    """¿Es caro o barato el barrio para lo que ofrece? (modelo LightGBM + SHAP)."""
+    d = B_WGS84.copy()
+    fiable = _modelo_fiable(d)
+    d["dif"] = (d["diferencia_pct"] * 100).where(fiable)
+    d["color"] = d["dif"].apply(lambda x: color_por_franja(x, FRANJAS_MODELO, 1000))
+    d["real_txt"] = d["eur_m2"].map(lambda x: f"{x:.1f} €/m²")
+    d["modelo_txt"] = d["eur_m2_modelo"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} €/m²")
+    d["dif_txt"] = d["dif"].map(lambda x: "sin datos fiables" if pd.isna(x) else f"{x:+.0f} %")
+    mapa = mapa_coloreado(
+        d, ["barrio", "real_txt", "modelo_txt", "dif_txt"],
+        ["Barrio", "Precio real", "Según lo que ofrece", "Diferencia"],
+    )
+
+    fila = B[B["barrio"] == NOMBRE_A_BARRIO[nombre]].iloc[0]
+    if not _modelo_fiable(B[B["barrio"] == fila["barrio"]]).iloc[0]:
+        texto = f"No hay datos suficientes de **{nombre}** para comparar su precio con el del modelo."
+    else:
+        dif = fila["diferencia_pct"]
+        if dif <= -0.03:
+            veredicto = f"🟢 **Un {abs(dif):.0%} más barato** de lo que cabría esperar por lo que ofrece."
+            lectura = ("Puede ser una buena oportunidad... o tener algo que el modelo no ve "
+                       "(viviendas más antiguas, menos renta, ruido). Merece la pena visitarlo.")
+        elif dif >= 0.03:
+            veredicto = f"🔴 **Un {dif:.0%} más caro** de lo que cabría esperar por lo que ofrece."
+            lectura = ("Aquí se paga un extra por cosas que el modelo no mide: el tipo de vivienda "
+                       "(chalets, urbanizaciones), la tranquilidad o el prestigio de la zona.")
+        else:
+            veredicto = "🟡 **Cuesta lo esperado** para lo que ofrece."
+            lectura = "Su precio encaja con su transporte, servicios y ocio."
+        texto = (
+            f"### {nombre}\n{veredicto}\n\n"
+            f"- Precio real: **{fila['eur_m2']:.1f} €/m²**\n"
+            f"- Lo que \"debería\" costar por lo que ofrece: **{fila['eur_m2_modelo']:.1f} €/m²**\n"
+            f"- Lo que más pesa en su precio: {fila['motivos_precio']}\n\n{lectura}"
+        )
+    texto += (
+        "\n\n*Modelo LightGBM entrenado con 2.345 secciones censales (transporte real, servicios, ocio, "
+        "tamaño de los pisos...). Validado prediciendo cada distrito sin haberlo visto: error medio "
+        "del 9,8 % (R² = 0,70). Las razones salen de SHAP.*"
+    )
+
+    fiables = B[_modelo_fiable(B)].assign(
+        Barrio=lambda x: x["barrio"].map(nombre_visible),
+        Distrito=lambda x: x["distrito"],
+        **{
+            "€/m² real": lambda x: x["eur_m2"].round(1),
+            "€/m² por lo que ofrece": lambda x: x["eur_m2_modelo"].round(1),
+            "Diferencia": lambda x: (x["diferencia_pct"] * 100).round(0).astype(int).astype(str) + " %",
+        },
+    )
+    cols = ["Barrio", "Distrito", "€/m² real", "€/m² por lo que ofrece", "Diferencia"]
+    baratos = fiables.nsmallest(10, "diferencia_pct")[cols]
+    caros = fiables.nlargest(10, "diferencia_pct")[cols]
+    return leyenda(FRANJAS_MODELO, "Sin datos fiables") + mapa, texto, baratos, caros
+
+
 def ver_evolucion(nombres):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -894,6 +964,26 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
             resultado_chk = gr.Markdown(elem_classes="resumen")
 
             with gr.Column(elem_classes="tarjeta"):
+                gr.Markdown("## 🤖 ¿Caro o barato para lo que ofrece?")
+                gr.Markdown("Un modelo de machine learning calcula cuánto *debería* costar cada barrio según "
+                            "su transporte, servicios y ocio, y lo compara con lo que se paga de verdad.")
+                with gr.Row():
+                    barrio_modelo = gr.Dropdown(list(NOMBRE_A_BARRIO), value="Pacífico", label="Barrio")
+                    boton_modelo = gr.Button("Analizar", variant="primary", elem_classes="boton-principal")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=1):
+                    resumen_modelo = gr.Markdown(elem_classes="resumen")
+                with gr.Column(scale=2):
+                    mapa_modelo = gr.HTML()
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 🟢 Más baratos de lo que deberían")
+                    baratos_modelo = gr.Dataframe(interactive=False)
+                with gr.Column():
+                    gr.Markdown("### 🔴 Más caros de lo que deberían")
+                    caros_modelo = gr.Dataframe(interactive=False)
+
+            with gr.Column(elem_classes="tarjeta"):
                 gr.Markdown("## 📈 ¿Cómo ha evolucionado el alquiler?")
                 barrios_evo = gr.Dropdown(
                     list(NOMBRE_A_BARRIO),
@@ -946,6 +1036,9 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
     boton_aseq.click(calcular_asequibilidad, entradas_aseq, [mapa_aseq, resumen_aseq])
     boton_chk.click(comprobar_precio, entradas_chk, resultado_chk)
     boton_evo.click(ver_evolucion, barrios_evo, [grafico_evo, resumen_evo, ranking_evo])
+    salidas_modelo = [mapa_modelo, resumen_modelo, baratos_modelo, caros_modelo]
+    boton_modelo.click(precio_justo, barrio_modelo, salidas_modelo)
+    barrio_modelo.change(precio_justo, barrio_modelo, salidas_modelo)
 
     demo.load(buscar, entradas, [mapa, tabla, resumen])
     demo.load(mi_casa, entradas_casa, salidas_casa)
@@ -954,6 +1047,7 @@ with gr.Blocks(title="¿Dónde vivir en Madrid?", **({} if GRADIO_6 else ESTILO)
     demo.load(calcular_asequibilidad, entradas_aseq, [mapa_aseq, resumen_aseq])
     demo.load(comprobar_precio, entradas_chk, resultado_chk)
     demo.load(ver_evolucion, barrios_evo, [grafico_evo, resumen_evo, ranking_evo])
+    demo.load(precio_justo, barrio_modelo, salidas_modelo)
 
 
 if __name__ == "__main__":

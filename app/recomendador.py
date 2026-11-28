@@ -18,6 +18,15 @@ B["geometry"] = B.simplify(15, preserve_topology=True)
 # Economía: rango de precios (p25-p75), tendencia y estimación 2026
 B = B.merge(pd.read_parquet(CARPETA / "barrios_economia.parquet"), on="cod_barrio", how="left")
 B["eur_m2_2026"] = B["eur_m2_estimado_2026"].fillna(B["eur_m2"])
+
+# Modelo de precio (notebook 10, LightGBM + SHAP): lo que "debería" costar cada barrio por lo que ofrece
+_RUTA_MODELO = CARPETA / "barrios_modelo.parquet"
+_COLS_MODELO = ["eur_m2_modelo", "diferencia_pct", "n_secciones", "motivos_precio"]
+if _RUTA_MODELO.exists():
+    B = B.merge(pd.read_parquet(_RUTA_MODELO)[["cod_barrio"] + _COLS_MODELO], on="cod_barrio", how="left")
+else:
+    for _c in _COLS_MODELO:
+        B[_c] = None
 COL_SUBIDA = next(c for c in B.columns if re.fullmatch(r"subida_\d{4}_\d{4}", c))
 ANO_BASE, ANO_ULTIMO = map(int, COL_SUBIDA.split("_")[1:])
 
