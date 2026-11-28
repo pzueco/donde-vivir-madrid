@@ -1,7 +1,9 @@
+from functools import lru_cache
 from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+from geopy.geocoders import Nominatim
 from shapely.geometry import Point
 
 CARPETA = Path(__file__).parent / "data"
@@ -14,7 +16,17 @@ B["geometry"] = B.simplify(15, preserve_topology=True)
 TIEMPOS = pd.read_parquet(CARPETA / "tiempos_barrio.parquet")
 REJILLA = gpd.read_parquet(CARPETA / "rejilla_destinos.parquet").to_crs(25830)
 
+# Contorno del municipio, para comprobar si una dirección está dentro
+MADRID_4326 = B.to_crs(4326).union_all()
+_XMIN, _YMIN, _XMAX, _YMAX = MADRID_4326.bounds
+
+# Geocodificador de OpenStreetMap (gratuito; máximo una consulta por segundo)
+_GEOLOCALIZADOR = Nominatim(
+    user_agent="donde-vivir-madrid (github.com/pzueco/donde-vivir-madrid)", timeout=10
+)
+
 DIAS_LABORABLES = 220
+VELOCIDAD_A_PIE = 80  # metros por minuto
 
 INDICES = ["precio", "transporte", "ocio", "tranquilidad", "cultura",
            "salud", "familia", "deporte", "dia_a_dia"]
@@ -46,12 +58,39 @@ def nombre_visible(barrio):
     return f"{barrio} ({NOMBRES_POPULARES[barrio]})" if barrio in NOMBRES_POPULARES else barrio
 
 
+@lru_cache(maxsize=500)
+def geocodificar(texto):
+    """Convierte una dirección en (lat, lon, dirección encontrada). None si no la encuentra."""
+    texto = texto.strip()
+    if not texto:
+        return None
+    consulta = texto if "madrid" in texto.lower() else f"{texto}, Madrid"
+    try:
+        r = _GEOLOCALIZADOR.geocode(
+            consulta, country_codes="es", language="es",
+            viewbox=[(_YMIN, _XMIN), (_YMAX, _XMAX)], bounded=False,
+        )
+    except Exception:
+        return None
+    if r is None:
+        return None
+    return r.latitude, r.longitude, r.address
+
+
+def dentro_de_madrid(lat, lon):
+    return MADRID_4326.contains(Point(lon, lat))
+
+
 def minutos_hasta(lat, lon):
     """Minutos en transporte público desde cada barrio hasta el punto (lat, lon)."""
     punto = gpd.GeoSeries([Point(lon, lat)], crs=4326).to_crs(25830).iloc[0]
-    destino = REJILLA.loc[REJILLA.distance(punto).idxmin(), "id"]
+    distancias = REJILLA.distance(punto)
+    i = distancias.idxmin()
+    destino = REJILLA.loc[i, "id"]
+    # Minutos andando desde el punto de la rejilla hasta la dirección exacta
+    extra = round(distancias.loc[i] / VELOCIDAD_A_PIE)
     t = TIEMPOS[TIEMPOS["id_destino"] == destino]
-    return t.set_index("cod_barrio")["minutos"]
+    return t.set_index("cod_barrio")["minutos"] + extra
 
 
 def idx_transporte_trabajo(minutos):
